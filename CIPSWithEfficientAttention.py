@@ -3,6 +3,113 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+
+class SineLayer(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+        self.init_weights()
+    
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features, 
+                                            1 / self.in_features)      
+            else:
+                self.linear.weight.uniform_(-math.sqrt(6 / self.in_features) / self.omega_0, 
+                                            math.sqrt(6 / self.in_features) / self.omega_0)
+        
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
+
+class FourierFeatures(nn.Module):
+    def __init__(self, input_dim, mapping_size=256, scale=10):
+        super().__init__()
+        self.input_dim = input_dim
+        self.mapping_size = mapping_size
+        self.B = nn.Parameter(torch.randn((input_dim, mapping_size)) * scale, requires_grad=False)
+    
+    def forward(self, x):
+        x = x.matmul(self.B)
+        return torch.sin(x)
+
+class ModulatedFC(nn.Module):
+    def __init__(self, in_features, out_features, style_dim):
+        super().__init__()
+        self.fc = nn.Linear(in_features, out_features)
+        self.modulation = nn.Linear(style_dim, in_features)
+        
+    def forward(self, x, style):
+        style = self.modulation(style).unsqueeze(1)
+        x = self.fc(x * style)
+        return x
+
+class CIPS(nn.Module):
+    def __init__(self, style_dim=512, num_layers=14, hidden_dim=512):
+        super().__init__()
+        self.style_dim = style_dim
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        
+        self.mapping_network = nn.Sequential(
+            nn.Linear(style_dim, style_dim),
+            nn.ReLU(),
+            nn.Linear(style_dim, style_dim),
+            nn.ReLU(),
+            nn.Linear(style_dim, style_dim),
+            nn.ReLU(),
+            nn.Linear(style_dim, style_dim)
+        )
+        
+        self.fourier_features = FourierFeatures(2, 256)
+        self.coord_embeddings = nn.Parameter(torch.randn(256, 256, 512))
+        
+        self.net = nn.ModuleList()
+        self.to_rgb = nn.ModuleList()
+        
+        for i in range(num_layers):
+            if i == 0:
+                self.net.append(ModulatedFC(512 + 256, hidden_dim, style_dim))
+            else:
+                self.net.append(ModulatedFC(hidden_dim, hidden_dim, style_dim))
+            
+            if i % 2 == 0 or i == num_layers - 1:
+                self.to_rgb.append(ModulatedFC(hidden_dim, 3, style_dim))
+        
+    def forward(self, coords, z):
+        batch_size = coords.shape[0]
+        
+        # Map z to w
+        w = self.mapping_network(z)
+        
+        # Get Fourier features and coordinate embeddings
+        fourier_features = self.fourier_features(coords)
+        coord_embeddings = F.grid_sample(
+            self.coord_embeddings.unsqueeze(0).expand(batch_size, -1, -1, -1),
+            coords.unsqueeze(1),
+            mode='bilinear',
+            align_corners=True
+        ).squeeze(2).permute(0, 2, 1)
+        
+        # Concatenate Fourier features and coordinate embeddings
+        x = torch.cat([fourier_features, coord_embeddings], dim=-1)
+        
+        rgb = 0
+        for i, (layer, to_rgb) in enumerate(zip(self.net, self.to_rgb)):
+            x = layer(x, w)
+            x = F.leaky_relu(x, 0.2)
+            
+            if i % 2 == 0 or i == self.num_layers - 1:
+                rgb = rgb + to_rgb(x, w)
+        
+        return torch.sigmoid(rgb)
+
+
 class AxialAttention(nn.Module):
     def __init__(self, dim, num_dimensions=2):
         super().__init__()
@@ -146,6 +253,19 @@ z = torch.randn(batch_size, style_dim)
 coords = torch.stack(torch.meshgrid(torch.linspace(-1, 1, image_size), torch.linspace(-1, 1, image_size)), dim=-1).unsqueeze(0).expand(batch_size, -1, -1, -1)
 
 model = CIPSWithEfficientAttention(attention_type='axial')
+output = model(coords.reshape(batch_size, -1, 2), z)
+output = output.reshape(batch_size, image_size, image_size, 3)
+
+print(output.shape)  # Should be [4, 256, 256, 3]
+# Example usage
+style_dim = 512
+batch_size = 4
+image_size = 256
+
+z = torch.randn(batch_size, style_dim)
+coords = torch.stack(torch.meshgrid(torch.linspace(-1, 1, image_size), torch.linspace(-1, 1, image_size)), dim=-1).unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+model = CIPS()
 output = model(coords.reshape(batch_size, -1, 2), z)
 output = output.reshape(batch_size, image_size, image_size, 3)
 
